@@ -88,7 +88,9 @@ app.get("/api/menu", async (req, res) => {
         stock,
         created_at
       FROM menu_items
-      ORDER BY id ASC
+      WHERE available = TRUE
+        AND stock > 0
+      ORDER BY category ASC, id ASC
     `);
 
     res.json(result.rows);
@@ -97,6 +99,7 @@ app.get("/api/menu", async (req, res) => {
 
     res.status(500).json({
       message: "Failed to fetch menu",
+      error: error.message,
     });
   }
 });
