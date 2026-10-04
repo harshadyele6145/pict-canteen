@@ -40,6 +40,222 @@ app.use("/api/payments", paymentsRoutes);
 
 app.use("/api/slots", slotsRoutes);
 
+app.get(
+  "/api/analytics/monthly",
+  authRoutes.verifyToken,
+  authRoutes.adminOnly,
+  async (req, res) => {
+    try {
+      const kolkataNow = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+      }).format(new Date());
+
+      const [defaultYear, defaultMonth] =
+        kolkataNow.split("-").map(Number);
+
+      const month = Number(req.query.month ?? defaultMonth);
+      const year = Number(req.query.year ?? defaultYear);
+
+      if (
+        !Number.isInteger(month) ||
+        month < 1 ||
+        month > 12 ||
+        !Number.isInteger(year) ||
+        year < 2000
+      ) {
+        return res.status(400).json({
+          message: "Valid month and year are required",
+        });
+      }
+
+      const summaryResult = await pool.query(
+        `
+        SELECT
+          COUNT(*) FILTER (
+            WHERE payment_status = 'PAID'
+          )::int AS total_paid_orders,
+          COALESCE(
+            SUM(total_amount) FILTER (
+              WHERE payment_status = 'PAID'
+            ),
+            0
+          )::numeric AS total_revenue,
+          COUNT(*) FILTER (
+            WHERE payment_status = 'PAID'
+              AND status = 'COMPLETED'
+          )::int AS total_completed_orders,
+          COUNT(*) FILTER (
+            WHERE payment_status = 'PAID'
+              AND order_mode = 'live'
+          )::int AS live_orders,
+          COUNT(*) FILTER (
+            WHERE payment_status = 'PAID'
+              AND order_mode = 'preorder'
+          )::int AS preorder_orders,
+          COALESCE(
+            SUM(total_amount) FILTER (
+              WHERE payment_status = 'PAID'
+                AND order_mode = 'live'
+            ),
+            0
+          )::numeric AS live_revenue,
+          COALESCE(
+            SUM(total_amount) FILTER (
+              WHERE payment_status = 'PAID'
+                AND order_mode = 'preorder'
+            ),
+            0
+          )::numeric AS preorder_revenue
+        FROM orders o
+        WHERE
+          payment_status = 'PAID'
+          AND (
+            (o.created_at AT TIME ZONE 'Asia/Kolkata')::date >=
+            make_date($1, $2, 1)
+          )
+          AND (
+            (o.created_at AT TIME ZONE 'Asia/Kolkata')::date <
+            (make_date($1, $2, 1) + INTERVAL '1 month')::date
+          )
+        `,
+        [year, month]
+      );
+
+      const itemsSoldResult = await pool.query(
+        `
+        SELECT
+          COALESCE(SUM(oi.quantity), 0)::int AS total_items_sold
+        FROM order_items oi
+        JOIN orders o
+          ON o.id = oi.order_id
+        WHERE
+          o.payment_status = 'PAID'
+          AND (
+            (o.created_at AT TIME ZONE 'Asia/Kolkata')::date >=
+            make_date($1, $2, 1)
+          )
+          AND (
+            (o.created_at AT TIME ZONE 'Asia/Kolkata')::date <
+            (make_date($1, $2, 1) + INTERVAL '1 month')::date
+          )
+        `,
+        [year, month]
+      );
+
+      const summary = summaryResult.rows[0] || {};
+      summary.total_items_sold =
+        itemsSoldResult.rows[0]?.total_items_sold || 0;
+
+      const dailyResult = await pool.query(
+        `
+        WITH calendar AS (
+          SELECT
+            generate_series(
+              1,
+              EXTRACT(DAY FROM (
+                make_date($1, $2, 1) + INTERVAL '1 month' - INTERVAL '1 day'
+              ))::int
+            ) AS day_number
+        )
+        SELECT
+          calendar.day_number,
+          to_char(
+            make_date($1, $2, calendar.day_number),
+            'YYYY-MM-DD'
+          ) AS date_key,
+          COALESCE(COUNT(o.id) FILTER (
+            WHERE o.payment_status = 'PAID'
+          ), 0)::int AS orders,
+          COALESCE(SUM(o.total_amount) FILTER (
+            WHERE o.payment_status = 'PAID'
+          ), 0)::numeric AS revenue
+        FROM calendar
+        LEFT JOIN orders o
+          ON (
+            (o.created_at AT TIME ZONE 'Asia/Kolkata')::date =
+            make_date($1, $2, calendar.day_number)
+          )
+          AND o.payment_status = 'PAID'
+        GROUP BY calendar.day_number
+        ORDER BY calendar.day_number ASC
+        `,
+        [year, month]
+      );
+
+      const topItemsResult = await pool.query(
+        `
+        SELECT
+          mi.name,
+          SUM(oi.quantity)::int AS quantity_sold,
+          COALESCE(SUM(oi.quantity * oi.price), 0)::numeric AS revenue
+        FROM order_items oi
+        JOIN menu_items mi
+          ON mi.id = oi.menu_item_id
+        JOIN orders o
+          ON o.id = oi.order_id
+        WHERE
+          o.payment_status = 'PAID'
+          AND (
+            (o.created_at AT TIME ZONE 'Asia/Kolkata')::date >=
+            make_date($1, $2, 1)
+          )
+          AND (
+            (o.created_at AT TIME ZONE 'Asia/Kolkata')::date <
+            (make_date($1, $2, 1) + INTERVAL '1 month')::date
+          )
+        GROUP BY mi.name
+        ORDER BY quantity_sold DESC, revenue DESC
+        LIMIT 5
+        `,
+        [year, month]
+      );
+
+      const totalPaidOrders = Number(summary.total_paid_orders || 0);
+      const totalRevenue = Number(summary.total_revenue || 0);
+
+      const response = {
+        month,
+        year,
+        summary: {
+          totalRevenue: Number(totalRevenue),
+          totalPaidOrders,
+          totalCompletedOrders: Number(summary.total_completed_orders || 0),
+          liveOrders: Number(summary.live_orders || 0),
+          preorderOrders: Number(summary.preorder_orders || 0),
+          totalItemsSold: Number(summary.total_items_sold || 0),
+          averageOrderValue:
+            totalPaidOrders > 0
+              ? Number(totalRevenue) / totalPaidOrders
+              : 0,
+          liveRevenue: Number(summary.live_revenue || 0),
+          preorderRevenue: Number(summary.preorder_revenue || 0),
+        },
+        dailyBreakdown: dailyResult.rows.map((item) => ({
+          date: item.date_key,
+          day: Number(item.day_number),
+          orders: Number(item.orders || 0),
+          revenue: Number(item.revenue || 0),
+        })),
+        topItems: topItemsResult.rows.map((item) => ({
+          name: item.name,
+          quantitySold: Number(item.quantity_sold || 0),
+          revenue: Number(item.revenue || 0),
+        })),
+      };
+
+      res.json(response);
+    } catch (error) {
+      console.error("Monthly analytics error:", error);
+
+      res.status(500).json({
+        message: "Failed to fetch monthly analytics",
+      });
+    }
+  }
+);
+
 /* =====================================================
    HEALTH
 ===================================================== */

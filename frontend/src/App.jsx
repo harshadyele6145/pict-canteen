@@ -2,7 +2,7 @@ import { useEffect, useState, useRef } from "react";
 import axios from "axios";
 import { io } from "socket.io-client";
 import { Html5Qrcode } from "html5-qrcode";
-import { QRCodeSVG } from "qrcode.react";
+import { QRCodeCanvas } from "qrcode.react";
 
 import {
   Search,
@@ -22,6 +22,7 @@ import {
   Zap,
   PackageCheck,
   RefreshCw,
+  BarChart3,
 } from "lucide-react";
 
 import Login from "./LoginTemp.jsx";
@@ -29,6 +30,149 @@ import Register from "./RegisterTemp.jsx";
 import "./App.css";
 
 const API_URL = "http://localhost:5000";
+
+function getIstMonthYear() {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "numeric",
+  }).formatToParts(new Date());
+
+  return {
+    month: Number(parts.find((part) => part.type === "month")?.value),
+    year: Number(parts.find((part) => part.type === "year")?.value),
+  };
+}
+
+function buildPickupQrValue(order) {
+  return JSON.stringify({
+    type: "PICT_CANTEEN_PICKUP",
+    order_id: Number(order.id),
+    pickup_token: String(order.pickup_token || "")
+      .trim()
+      .toUpperCase(),
+  });
+}
+
+function formatTimeLabel(value) {
+  if (!value) {
+    return "";
+  }
+
+  const text = String(value);
+  const match = text.match(/^(\d{1,2}):(\d{2})/);
+
+  if (!match) {
+    return text;
+  }
+
+  let hours = Number(match[1]);
+  const minutes = match[2];
+  const suffix = hours >= 12 ? "PM" : "AM";
+  hours = hours % 12 || 12;
+
+  return `${hours}:${minutes} ${suffix}`;
+}
+
+function getCameraErrorMessage(error) {
+  const name = String(error?.name || "");
+  const message = String(error?.message || error || "").toLowerCase();
+
+  if (name === "InsecureContextError") {
+    return "Camera scanning needs a secure origin. Use localhost or HTTPS.";
+  }
+
+  if (
+    name === "NotAllowedError" ||
+    message.includes("permission") ||
+    message.includes("notallowed") ||
+    message.includes("denied")
+  ) {
+    return "Camera permission was denied. Allow camera access and tap retry.";
+  }
+
+  if (
+    name === "NotFoundError" ||
+    message.includes("requested device not found") ||
+    message.includes("no cameras") ||
+    message.includes("camera not found")
+  ) {
+    return "No camera is available on this device.";
+  }
+
+  if (
+    name === "NotReadableError" ||
+    name === "TrackStartError" ||
+    message.includes("could not start video source")
+  ) {
+    return "The camera could not start. Close other apps or tabs using it, then retry.";
+  }
+
+  if (
+    message.includes("insecure") ||
+    message.includes("https") ||
+    message.includes("secure origin")
+  ) {
+    return "Camera scanning needs a secure origin. Use localhost or HTTPS.";
+  }
+
+  return "Unable to start the camera. Please allow camera permission and try again.";
+}
+
+function mapPickupScanError(error) {
+  if (!error.response) {
+    return {
+      title: "Network error",
+      message: "Could not reach the server. Check your connection and try again.",
+    };
+  }
+
+  const code = error.response?.data?.code;
+  const message =
+    error.response?.data?.message ||
+    error.message ||
+    "Pickup verification failed.";
+
+  if (code === "ALREADY_PICKED_UP") {
+    return {
+      title: "Order Already Picked Up",
+      message,
+    };
+  }
+
+  if (code === "UNPAID") {
+    return {
+      title: "Payment Not Completed",
+      message,
+    };
+  }
+
+  if (code === "UNKNOWN_ORDER") {
+    return {
+      title: "Invalid Pickup QR",
+      message: "Unknown order.",
+    };
+  }
+
+  if (code === "INVALID_TOKEN") {
+    return {
+      title: "Invalid Pickup Token",
+      message,
+    };
+  }
+
+  if (code === "AMBIGUOUS_TOKEN") {
+    return {
+      title: "Token Verification Failed",
+      message,
+    };
+  }
+
+  return {
+    title: "Invalid Pickup QR",
+    message,
+  };
+}
 
 function App() {
   // =========================================================
@@ -127,11 +271,11 @@ function App() {
   const [stockUpdating, setStockUpdating] =
     useState({});
 
-  const [pickupToken, setPickupToken] =
-    useState("");
-
   const [pickupLoading, setPickupLoading] =
     useState(false);
+
+  const [pickupTokenInput, setPickupTokenInput] =
+    useState("");
 
   const [qrScannerOpen, setQrScannerOpen] =
     useState(false);
@@ -139,7 +283,46 @@ function App() {
   const [qrScannerLoading, setQrScannerLoading] =
     useState(false);
 
+  const [scannerError, setScannerError] =
+    useState("");
+
+  const [pickupScanResult, setPickupScanResult] =
+    useState(null);
+
+  const [analyticsOpen, setAnalyticsOpen] =
+    useState(false);
+
+  const [analyticsLoading, setAnalyticsLoading] =
+    useState(false);
+
+  const [analyticsMonth, setAnalyticsMonth] =
+    useState(() => {
+      const formatted = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+      }).format(new Date());
+
+      return Number(formatted.split("-")[1]);
+    });
+
+  const [analyticsYear, setAnalyticsYear] =
+    useState(() => {
+      const formatted = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+      }).format(new Date());
+
+      return Number(formatted.split("-")[0]);
+    });
+
+  const [monthlyAnalytics, setMonthlyAnalytics] =
+    useState(null);
+
   const qrScannerRef = useRef(null);
+  const scanInFlightRef = useRef(false);
+  const compositionRef = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -152,7 +335,7 @@ function App() {
           .finally(() => {
             try {
               scanner.clear();
-            } catch (error) {}
+            } catch {}
           });
       }
     };
@@ -252,6 +435,41 @@ function App() {
     }
   };
 
+  const fetchMonthlyAnalytics = async () => {
+    if (user?.role !== "admin") {
+      return;
+    }
+
+    try {
+      setAnalyticsLoading(true);
+      const token = localStorage.getItem("token");
+
+      const response = await axios.get(
+        `${API_URL}/api/analytics/monthly`,
+        {
+          params: {
+            month: analyticsMonth,
+            year: analyticsYear,
+          },
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      setMonthlyAnalytics(response.data || null);
+    } catch (error) {
+      console.error("Fetch analytics error:", error);
+      setMonthlyAnalytics(null);
+      alert(
+        error.response?.data?.message ||
+          "Failed to load monthly analytics."
+      );
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  };
+
   // =========================================================
   // INITIAL LOAD
   // =========================================================
@@ -264,8 +482,17 @@ function App() {
   useEffect(() => {
     if (user?.role === "admin") {
       fetchAdminOrders();
+      if (analyticsOpen) {
+        fetchMonthlyAnalytics();
+      }
     }
-  }, [user]);
+  }, [user, analyticsOpen]);
+
+  useEffect(() => {
+    if (user?.role === "admin" && analyticsOpen) {
+      fetchMonthlyAnalytics();
+    }
+  }, [analyticsMonth, analyticsYear, user?.role]);
 
   // =========================================================
   // SOCKET.IO
@@ -340,6 +567,14 @@ function App() {
 
         if (user?.role === "admin") {
           fetchAdminOrders();
+        } else {
+          setStudentOrders((previous) =>
+            previous.map((order) =>
+              Number(order.id) === Number(updatedOrder?.id)
+                ? { ...order, ...updatedOrder }
+                : order
+            )
+          );
         }
       }
     );
@@ -1321,88 +1556,6 @@ function App() {
   }, [user]);
 
   // =========================================================
-  // VERIFY PICKUP
-  // =========================================================
-
-  const verifyPickup = async (
-    orderId,
-    tokenValue
-  ) => {
-    if (!orderId) {
-      alert(
-        "Order ID is required."
-      );
-      return false;
-    }
-
-    const token = String(
-      tokenValue || ""
-    )
-      .trim()
-      .toUpperCase();
-
-    if (!token) {
-      alert(
-        "Pickup token is required."
-      );
-      return false;
-    }
-
-    try {
-      setPickupLoading(true);
-
-      const authToken =
-        localStorage.getItem(
-          "token"
-        );
-
-      const response =
-        await axios.post(
-          `${API_URL}/api/orders/${orderId}/pickup`,
-          {
-            pickup_token: token,
-          },
-          {
-            headers: {
-              Authorization:
-                `Bearer ${authToken}`,
-            },
-          }
-        );
-
-      const completedOrder =
-        response.data?.order ||
-        response.data;
-
-      setCurrentOrder(
-        (previous) => ({
-          ...previous,
-          ...completedOrder,
-        })
-      );
-
-      await fetchAdminOrders();
-
-      return true;
-    } catch (error) {
-      console.error(
-        "Pickup verification error:",
-        error
-      );
-
-      alert(
-        error.response?.data
-          ?.message ||
-          "Pickup verification failed."
-      );
-
-      return false;
-    } finally {
-      setPickupLoading(false);
-    }
-  };
-
-  // =========================================================
   // QR PICKUP SCANNER
   // =========================================================
 
@@ -1423,75 +1576,292 @@ function App() {
 
     try {
       scanner.clear();
-    } catch (error) {}
+    } catch {}
 
     qrScannerRef.current = null;
     setQrScannerOpen(false);
     setQrScannerLoading(false);
   };
 
-  const startQrScanner = async () => {
-    if (qrScannerRef.current) return;
+  const verifyScannedQr = async (decodedText) => {
+    try {
+      setPickupLoading(true);
+      setScannerError("");
 
-    setQrScannerOpen(true);
-    setQrScannerLoading(true);
+      const authToken = localStorage.getItem("token");
+
+      const response = await axios.post(
+        `${API_URL}/api/orders/scan-qr`,
+        { qr: decodedText },
+        {
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+          },
+        }
+      );
+
+      const completedOrder =
+        response.data?.order || response.data;
+
+      setPickupScanResult({
+        ok: true,
+        ...completedOrder,
+        status: "COMPLETED",
+        payment_status: "PAID",
+      });
+
+      await fetchAdminOrders();
+      await stopQrScanner();
+      return true;
+    } catch (error) {
+      console.error("QR pickup scan error:", error);
+
+      const mapped = mapPickupScanError(error);
+
+      setPickupScanResult({
+        ok: false,
+        title: mapped.title,
+        message: mapped.message,
+      });
+
+      setScannerError(mapped.title);
+      return false;
+    } finally {
+      setPickupLoading(false);
+      scanInFlightRef.current = false;
+    }
+  };
+
+  const verifyPickupToken = async (event) => {
+    event.preventDefault();
+
+    const pickupToken = pickupTokenInput.trim().toUpperCase();
+
+    if (!/^[A-Z0-9]{6}$/.test(pickupToken)) {
+      setPickupScanResult({
+        ok: false,
+        title: "Invalid Pickup Token",
+        message: "Enter the student's 6-character pickup token.",
+      });
+      return;
+    }
 
     try {
-      const scanner = new Html5Qrcode(
-        "pickup-qr-reader"
+      setPickupLoading(true);
+      setScannerError("");
+
+      const authToken = localStorage.getItem("token");
+      const response = await axios.post(
+        `${API_URL}/api/orders/pickup-token`,
+        { pickup_token: pickupToken },
+        {
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+          },
+        }
       );
 
-      qrScannerRef.current = scanner;
+      const completedOrder = response.data?.order || response.data;
+      setPickupScanResult({
+        ok: true,
+        ...completedOrder,
+        status: "COMPLETED",
+        payment_status: "PAID",
+      });
+      setPickupTokenInput("");
+      await fetchAdminOrders();
+    } catch (error) {
+      console.error("Pickup token verification error:", error);
+      const mapped = mapPickupScanError(error);
+      setPickupScanResult({
+        ok: false,
+        title: mapped.title,
+        message: mapped.message,
+      });
+    } finally {
+      setPickupLoading(false);
+    }
+  };
 
-      await scanner.start(
-        { facingMode: "environment" },
-        {
+  const verifyScannedQrRef = useRef(verifyScannedQr);
+  verifyScannedQrRef.current = verifyScannedQr;
+
+  useEffect(() => {
+    if (!qrScannerOpen) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const bootScanner = async () => {
+      if (qrScannerRef.current) {
+        return;
+      }
+
+      setQrScannerLoading(true);
+
+      const reader = document.getElementById("pickup-qr-reader");
+
+      if (!reader) {
+        setScannerError("Scanner could not start. Please try again.");
+        setQrScannerLoading(false);
+        setQrScannerOpen(false);
+        return;
+      }
+
+      try {
+        if (
+          !window.isSecureContext ||
+          !navigator.mediaDevices?.getUserMedia
+        ) {
+          throw Object.assign(
+            new Error("Camera access requires a secure browser context."),
+            { name: "InsecureContextError" }
+          );
+        }
+
+        const cameras = await Html5Qrcode.getCameras();
+
+        if (cancelled) {
+          return;
+        }
+
+        if (!cameras || cameras.length === 0) {
+          throw new Error("No cameras found");
+        }
+
+        const rearCamera = cameras.find((camera) =>
+          /back|rear|environment/i.test(camera.label || "")
+        );
+        const isMobileDevice =
+          /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const preferredCamera = isMobileDevice
+          ? rearCamera?.id
+          : cameras[0]?.id;
+
+        const cameraSources = [
+          ...(preferredCamera
+            ? [preferredCamera]
+            : [{ facingMode: { ideal: "environment" } }]),
+          ...cameras
+            .map((camera) => camera.id)
+            .filter((cameraId) => cameraId !== preferredCamera),
+          ...(isMobileDevice && !rearCamera
+            ? [{ facingMode: { ideal: "environment" } }]
+            : []),
+        ];
+        const scannerConfig = {
           fps: 10,
-          qrbox: { width: 250, height: 250 },
-        },
-        async (decodedText) => {
+          qrbox: (viewfinderWidth, viewfinderHeight) => {
+            const edge = Math.min(viewfinderWidth, viewfinderHeight);
+            const size = Math.min(edge, Math.max(180, Math.floor(edge * 0.72)));
+            return { width: size, height: size };
+          },
+        };
+        let lastCameraError;
+
+        for (const cameraSource of cameraSources) {
+          const scanner = new Html5Qrcode("pickup-qr-reader");
+          qrScannerRef.current = scanner;
+
           try {
-            const data = JSON.parse(decodedText);
+            await scanner.start(
+              cameraSource,
+              scannerConfig,
+              async (decodedText) => {
+                if (scanInFlightRef.current) {
+                  return;
+                }
 
-            if (
-              data?.type !==
-                "PICT_CANTEEN_PICKUP" ||
-              !data?.order_id ||
-              !data?.pickup_token
-            ) {
-              alert("Invalid PICT Canteen pickup QR.");
-              return;
-            }
+                scanInFlightRef.current = true;
+                setScannerError("");
 
-            await stopQrScanner();
+                let parsed = null;
 
-            const success = await verifyPickup(
-              Number(data.order_id),
-              data.pickup_token
+                try {
+                  parsed = JSON.parse(decodedText);
+                } catch {
+                  setPickupScanResult({
+                    ok: false,
+                    title: "Invalid Pickup QR",
+                    message: "This QR is not a PICT Canteen pickup code.",
+                  });
+                  setScannerError("Invalid Pickup QR");
+                  scanInFlightRef.current = false;
+                  return;
+                }
+
+                if (
+                  parsed?.type !== "PICT_CANTEEN_PICKUP" ||
+                  !parsed?.order_id ||
+                  !parsed?.pickup_token
+                ) {
+                  setPickupScanResult({
+                    ok: false,
+                    title: "Invalid Pickup QR",
+                    message: "Unsupported QR payload.",
+                  });
+                  setScannerError("Invalid Pickup QR");
+                  scanInFlightRef.current = false;
+                  return;
+                }
+
+                await verifyScannedQrRef.current(decodedText);
+              },
+              () => {}
             );
 
-            if (success) {
-              alert("Pickup verified successfully.");
-            }
+            break;
           } catch (error) {
-            console.error("QR scan parse error:", error);
-            alert("Invalid QR code. Please scan the student's pickup QR.");
+            lastCameraError = error;
+            qrScannerRef.current = null;
+
+            try {
+              if (scanner.isScanning) {
+                await scanner.stop();
+              }
+              scanner.clear();
+            } catch (cleanupError) {
+              console.error("QR scanner cleanup error:", cleanupError);
+            }
           }
-        },
-        () => {}
-      );
+        }
 
-      setQrScannerLoading(false);
-    } catch (error) {
-      console.error("QR scanner start error:", error);
-      qrScannerRef.current = null;
-      setQrScannerOpen(false);
-      setQrScannerLoading(false);
+        if (!qrScannerRef.current) {
+          throw lastCameraError || new Error("Unable to start any available camera.");
+        }
 
-      alert(
-        "Unable to start camera. Please allow camera permission and try again."
-      );
+        if (!cancelled) {
+          setQrScannerLoading(false);
+        }
+      } catch (error) {
+        console.error("QR scanner start error:", error);
+
+        if (!cancelled) {
+          qrScannerRef.current = null;
+          setQrScannerOpen(false);
+          setQrScannerLoading(false);
+          setScannerError(getCameraErrorMessage(error));
+        }
+      }
+    };
+
+    bootScanner();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [qrScannerOpen]);
+
+  const startQrScanner = () => {
+    if (qrScannerRef.current || qrScannerLoading || qrScannerOpen) {
+      return;
     }
+
+    scanInFlightRef.current = false;
+    setPickupScanResult(null);
+    setScannerError("");
+    setQrScannerOpen(true);
   };
 
   // =========================================================
@@ -1505,6 +1875,23 @@ function App() {
       ? "Preorder"
       : "Live Order";
   };
+
+  const formatCurrency = (value) =>
+    `₹${Number(value || 0).toLocaleString(
+      "en-IN",
+      {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }
+    )}`;
+
+  const getMonthName = (month) =>
+    new Date(2024, month - 1, 1).toLocaleString(
+      "en-IN",
+      {
+        month: "long",
+      }
+    );
 
   // =========================================================
   // AUTH SCREEN
@@ -2651,9 +3038,7 @@ function App() {
 
                 </div>
 
-                {status !==
-                  "COMPLETED" &&
-                  order.pickup_token && (
+                {order.pickup_token && (
 
                     <div
                       className="pickup-token-card"
@@ -2667,47 +3052,37 @@ function App() {
                         Pickup QR
                       </span>
 
-                      <div
-                        style={{
-                          display:
-                            "flex",
-                          justifyContent:
-                            "center",
-                          margin:
-                            "18px 0",
-                        }}
-                      >
-
-                        <QRCodeSVG
-                          value={JSON.stringify(
-                            {
-                              type:
-                                "PICT_CANTEEN_PICKUP",
-
-                              order_id:
-                                Number(
-                                  order.id
-                                ),
-
-                              pickup_token:
-                                order.pickup_token,
-                            }
-                          )}
-                          size={220}
-                          level="H"
-                        />
-
-                      </div>
-
-                      <strong>
+                      <strong className="pickup-order-heading">
                         Order #{order.id}
                       </strong>
 
+                      <p className="pickup-order-meta">
+                        {getOrderModeLabel(order.order_mode)}
+                        {order.slot_id
+                          ? ` · ${getSlotText(order)}`
+                          : ""}
+                      </p>
+
+                      <div className="pickup-qr-frame">
+                        <QRCodeCanvas
+                          value={buildPickupQrValue(order)}
+                          size={320}
+                          level="M"
+                          includeMargin
+                          bgColor="#ffffff"
+                          fgColor="#000000"
+                          marginSize={4}
+                        />
+                      </div>
+
+                      <strong className="pickup-token-value">
+                        Pickup Token: {order.pickup_token}
+                      </strong>
+
                       <p>
-                        Show this QR code
-                        at the canteen
-                        counter to collect
-                        your order.
+                        {status === "COMPLETED"
+                          ? "This order has already been picked up."
+                          : "Show this QR code at the canteen counter to collect your order."}
                       </p>
 
                     </div>
@@ -2925,17 +3300,32 @@ function App() {
             </p>
           </div>
 
-          <button
-            className="admin-action-btn"
-            onClick={async () => {
-              await fetchAdminOrders();
-              await fetchMenu();
-              await fetchSlots();
-            }}
-          >
-            <RefreshCw size={15} />
-            Refresh
-          </button>
+          <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
+            <button
+              className="admin-action-btn"
+              onClick={() => {
+                setAnalyticsOpen((previous) => !previous);
+              }}
+            >
+              <BarChart3 size={15} />
+              Monthly Analytics
+            </button>
+
+            <button
+              className="admin-action-btn"
+              onClick={async () => {
+                await fetchAdminOrders();
+                await fetchMenu();
+                await fetchSlots();
+                if (analyticsOpen) {
+                  await fetchMonthlyAnalytics();
+                }
+              }}
+            >
+              <RefreshCw size={15} />
+              Refresh
+            </button>
+          </div>
 
         </div>
 
@@ -3022,6 +3412,171 @@ function App() {
           </div>
 
         </div>
+
+        {analyticsOpen && (
+          <section className="admin-section">
+            <div className="admin-section-header">
+              <div>
+                <h2>Monthly Analytics</h2>
+                <p>Revenue, items sold and order trends for the selected month.</p>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", marginBottom: "18px" }}>
+              <select
+                value={analyticsMonth}
+                onChange={(e) => setAnalyticsMonth(Number(e.target.value))}
+                className="form-control"
+              >
+                {[1,2,3,4,5,6,7,8,9,10,11,12].map((month) => (
+                  <option key={month} value={month}>
+                    {getMonthName(month)}
+                  </option>
+                ))}
+              </select>
+
+              <select
+                value={analyticsYear}
+                onChange={(e) => setAnalyticsYear(Number(e.target.value))}
+                className="form-control"
+              >
+                {[2024, 2025, 2026, 2027].map((year) => (
+                  <option key={year} value={year}>
+                    {year}
+                  </option>
+                ))}
+              </select>
+
+              <button className="admin-action-btn" onClick={fetchMonthlyAnalytics} disabled={analyticsLoading}>
+                {analyticsLoading ? "Loading..." : "Apply"}
+              </button>
+            </div>
+
+            {analyticsLoading ? (
+              <div className="admin-empty-state">Loading analytics...</div>
+            ) : monthlyAnalytics ? (
+              <>
+                <div className="admin-stats">
+                  <div className="admin-stat-card">
+                    <div className="admin-stat-icon"><ClipboardList size={22} /></div>
+                    <div>
+                      <span>Total Revenue</span>
+                      <strong>{formatCurrency(monthlyAnalytics.summary.totalRevenue)}</strong>
+                    </div>
+                  </div>
+
+                  <div className="admin-stat-card">
+                    <div className="admin-stat-icon"><Clock size={22} /></div>
+                    <div>
+                      <span>Total Paid Orders</span>
+                      <strong>{monthlyAnalytics.summary.totalPaidOrders}</strong>
+                    </div>
+                  </div>
+
+                  <div className="admin-stat-card">
+                    <div className="admin-stat-icon"><CheckCircle2 size={22} /></div>
+                    <div>
+                      <span>Total Completed</span>
+                      <strong>{monthlyAnalytics.summary.totalCompletedOrders}</strong>
+                    </div>
+                  </div>
+
+                  <div className="admin-stat-card">
+                    <div className="admin-stat-icon"><Utensils size={22} /></div>
+                    <div>
+                      <span>Items Sold</span>
+                      <strong>{monthlyAnalytics.summary.totalItemsSold}</strong>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "18px", marginTop: "18px" }}>
+                  <div className="admin-order-card">
+                    <h3>Live vs Preorder</h3>
+                    <div className="summary-row"><span>Live Orders</span><strong>{monthlyAnalytics.summary.liveOrders}</strong></div>
+                    <div className="summary-row"><span>Live Revenue</span><strong>{formatCurrency(monthlyAnalytics.summary.liveRevenue)}</strong></div>
+                    <div className="summary-row"><span>Preorders</span><strong>{monthlyAnalytics.summary.preorderOrders}</strong></div>
+                    <div className="summary-row"><span>Preorder Revenue</span><strong>{formatCurrency(monthlyAnalytics.summary.preorderRevenue)}</strong></div>
+                  </div>
+
+                  <div className="admin-order-card">
+                    <h3>Summary</h3>
+                    <div className="summary-row"><span>Average Order Value</span><strong>{formatCurrency(monthlyAnalytics.summary.averageOrderValue)}</strong></div>
+                    <div className="summary-row"><span>Completed Orders</span><strong>{monthlyAnalytics.summary.totalCompletedOrders}</strong></div>
+                    <div className="summary-row"><span>Month</span><strong>{getMonthName(monthlyAnalytics.month)} {monthlyAnalytics.year}</strong></div>
+                  </div>
+                </div>
+
+                <div className="admin-order-card" style={{ marginTop: "18px" }}>
+                  <h3>Daily Revenue Breakdown</h3>
+                  <div style={{ maxHeight: "240px", overflowY: "auto" }}>
+                    {monthlyAnalytics.dailyBreakdown.map((day) => (
+                      <div key={day.date} className="summary-row">
+                        <span>{new Date(`${day.date}T00:00:00+05:30`).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}</span>
+                        <strong>{day.orders} | {formatCurrency(day.revenue)}</strong>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="admin-order-card" style={{ marginTop: "18px" }}>
+                  <h3>Monthly Revenue Chart</h3>
+                  {monthlyAnalytics.dailyBreakdown.length > 0 ? (
+                    (() => {
+                      const maxRevenue = Math.max(
+                        ...monthlyAnalytics.dailyBreakdown.map(
+                          (entry) => Number(entry.revenue || 0)
+                        ),
+                        1
+                      );
+
+                      return (
+                        <div className="revenue-chart" aria-label="Monthly revenue chart">
+                          {monthlyAnalytics.dailyBreakdown.map((entry) => {
+                            const height =
+                              (Number(entry.revenue || 0) / maxRevenue) * 100;
+
+                            return (
+                              <div
+                                className="revenue-chart-bar-wrap"
+                                key={entry.date}
+                                title={`${entry.date}: ${formatCurrency(entry.revenue)}`}
+                              >
+                                <div
+                                  className="revenue-chart-bar"
+                                  style={{ height: `${Math.max(height, 2)}%` }}
+                                />
+                                <span>{entry.day}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()
+                  ) : (
+                    <p>No revenue data available for this month.</p>
+                  )}
+                </div>
+
+                <div className="admin-order-card" style={{ marginTop: "18px" }}>
+                  <h3>Top Selling Food</h3>
+                  {(monthlyAnalytics.topItems || []).length > 0 ? (
+                    monthlyAnalytics.topItems.map((item) => (
+                      <div key={item.name} className="summary-row">
+                        <span>{item.name}</span>
+                        <strong>{item.quantitySold} sold | {formatCurrency(item.revenue)}</strong>
+                      </div>
+                    ))
+                  ) : (
+                    <p>No paid orders yet for this month.</p>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="admin-empty-state">No analytics available for this month.</div>
+            )}
+          </section>
+        )}
 
         {/* =================================================
             PREPARATION QUEUE
@@ -3237,8 +3792,7 @@ function App() {
               </h2>
 
               <p>
-                Verify the student's
-                pickup token.
+                Scan the student pickup QR to verify and complete the order.
               </p>
 
             </div>
@@ -3269,115 +3823,182 @@ function App() {
                   ? "Starting Camera..."
                   : qrScannerOpen
                   ? "Stop QR Scanner"
-                  : "Scan Student QR"}
+                  : "Scan Pickup QR"}
               </button>
 
-              {qrScannerOpen && (
-                <div
-                  style={{
-                    width: "100%",
-                    maxWidth: "420px",
-                    margin: "0 auto",
-                    overflow: "hidden",
-                    borderRadius: "16px",
-                    border: "1px solid #ddd",
-                  }}
-                >
-                  <div id="pickup-qr-reader" />
+              <div
+                className={
+                  qrScannerOpen
+                    ? "qr-scanner-frame"
+                    : "qr-reader-idle"
+                }
+              >
+                <div id="pickup-qr-reader" />
+              </div>
+
+              {scannerError && (
+                <div className="error-banner">
+                  {scannerError}
                 </div>
               )}
+
+              <form
+                className="pickup-token-fallback"
+                onSubmit={verifyPickupToken}
+              >
+                <div>
+                  <h3>Camera not working?</h3>
+                  <p>
+                    Enter the student's pickup token to verify the order
+                    instead.
+                  </p>
+                </div>
+                <label htmlFor="pickup-token-input">
+                  Pickup token
+                </label>
+                <div className="pickup-token-controls">
+                  <input
+                    id="pickup-token-input"
+                    type="text"
+                    value={pickupTokenInput}
+                    onChange={(event) => {
+                      // Allow continuous typing; sanitize later on composition end or paste
+                      const v = event.target.value;
+                      setPickupTokenInput(v.slice(0, 6));
+                    }}
+                    onCompositionStart={() => (compositionRef.current = true)}
+                    onCompositionEnd={(event) => {
+                      compositionRef.current = false;
+                      const sanitized = event.target.value
+                        .replace(/[^a-z0-9]/gi, "")
+                        .toUpperCase()
+                        .slice(0, 6);
+                      setPickupTokenInput(sanitized);
+                    }}
+                    onPaste={(event) => {
+                      event.preventDefault();
+                      const text = (event.clipboardData || window.clipboardData)
+                        .getData("text")
+                        .replace(/[^a-z0-9]/gi, "")
+                        .toUpperCase()
+                        .slice(0, 6);
+                      setPickupTokenInput(text);
+                    }}
+                    autoComplete="off"
+                    maxLength={6}
+                    placeholder="e.g. MF9X3N"
+                    aria-label="Student pickup token"
+                    disabled={pickupLoading || qrScannerOpen}
+                  />
+                  <button
+                    type="submit"
+                    className="verify-pickup-btn"
+                    disabled={
+                      pickupLoading ||
+                      qrScannerLoading ||
+                      qrScannerOpen ||
+                      pickupTokenInput.length !== 6
+                    }
+                  >
+                    {pickupLoading
+                      ? "Verifying..."
+                      : "Verify Token & Complete Order"}
+                  </button>
+                </div>
+                {qrScannerOpen && (
+                  <p className="pickup-token-note">
+                    Stop the camera scanner before using token verification.
+                  </p>
+                )}
+              </form>
             </div>
 
-            <div className="pickup-input-group">
+            {pickupScanResult?.ok && (
+              <div className="scan-result-card">
+                <h3>Pickup Verified ✓</h3>
 
-              <label>
-                Order ID
-              </label>
+                <div className="order-details-grid">
+                  <div className="order-detail-box">
+                    <span>Order</span>
+                    <strong>
+                      #{pickupScanResult.id}
+                    </strong>
+                  </div>
 
-              <input
-                id="pickup-order-id"
-                type="number"
-                placeholder="Enter order ID"
-              />
+                  <div className="order-detail-box">
+                    <span>Student</span>
+                    <strong>
+                      {pickupScanResult.student_name || "Student"}
+                    </strong>
+                  </div>
 
-            </div>
+                  <div className="order-detail-box">
+                    <span>Order Type</span>
+                    <strong>
+                      {getOrderModeLabel(
+                        pickupScanResult.order_mode
+                      )}
+                    </strong>
+                  </div>
 
-            <div className="pickup-input-group">
+                  <div className="order-detail-box">
+                    <span>Pickup Slot</span>
+                    <strong>
+                      {pickupScanResult.slot_id
+                        ? formatTimeLabel(
+                            pickupScanResult.start_time ||
+                              pickupScanResult.slot_time
+                          ) || "Today's slot"
+                        : "Live Order"}
+                    </strong>
+                  </div>
+                </div>
 
-              <label>
-                Pickup Token
-              </label>
+                <div style={{ marginTop: "16px" }}>
+                  <h4>Items</h4>
+                  {(pickupScanResult.items || []).map(
+                    (item, index) => (
+                      <div
+                        key={item.menu_item_id || index}
+                        className="admin-order-item"
+                      >
+                        <span>{item.name}</span>
+                        <strong>× {item.quantity}</strong>
+                      </div>
+                    )
+                  )}
+                </div>
 
-              <input
-                type="text"
-                placeholder="Enter pickup token"
-                value={pickupToken}
-                onChange={(e) =>
-                  setPickupToken(
-                    e.target.value
-                      .toUpperCase()
-                  )
-                }
-                maxLength={20}
-              />
+                <div className="summary-row">
+                  <span>Total</span>
+                  <strong>
+                    {formatCurrency(
+                      pickupScanResult.total_amount || 0
+                    )}
+                  </strong>
+                </div>
 
-            </div>
+                <div className="summary-row">
+                  <span>Status</span>
+                  <strong>COMPLETED</strong>
+                </div>
+              </div>
+            )}
 
-            <button
-              className="verify-pickup-btn"
-              disabled={
-                pickupLoading
-              }
-              onClick={async () => {
-
-                const input =
-                  document.getElementById(
-                    "pickup-order-id"
-                  );
-
-                const orderId =
-                  Number(
-                    input?.value
-                  );
-
-                if (
-                  !Number.isInteger(
-                    orderId
-                  ) ||
-                  orderId <= 0
-                ) {
-                  alert(
-                    "Enter a valid order ID."
-                  );
-                  return;
-                }
-
-                const success =
-                  await verifyPickup(
-                    orderId,
-                    pickupToken
-                  );
-
-                if (success) {
-
-                  setPickupToken("");
-
-                  if (input) {
-                    input.value = "";
-                  }
-
-                  alert(
-                    "Pickup verified successfully."
-                  );
-                }
-
-              }}
-            >
-              {pickupLoading
-                ? "Verifying..."
-                : "Verify Pickup"}
-            </button>
-
+            {pickupScanResult && pickupScanResult.ok === false && (
+              <div className="scan-result-card scan-result-error">
+                <h3>{pickupScanResult.title}</h3>
+                <p>{pickupScanResult.message}</p>
+                <button
+                  type="button"
+                  className="verify-pickup-btn"
+                  onClick={startQrScanner}
+                  disabled={qrScannerLoading || qrScannerOpen}
+                >
+                  Retry Scanner
+                </button>
+              </div>
+            )}
           </div>
 
         </section>

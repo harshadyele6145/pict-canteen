@@ -5,6 +5,154 @@ const router = express.Router();
 const pool = require("../db");
 const authRoutes = require("./auth");
 
+function parsePositiveInteger(value) {
+  const parsedValue = Number(value);
+
+  return Number.isInteger(parsedValue) && parsedValue > 0
+    ? parsedValue
+    : null;
+}
+
+async function finalizePickup({
+  client,
+  req,
+  orderId,
+  pickupToken,
+}) {
+  const orderResult = await client.query(
+    `
+    SELECT
+      o.*,
+
+      u.name AS student_name,
+      u.email AS student_email,
+
+      ts.slot_time,
+      ts.slot_date,
+      ts.start_time,
+      ts.end_time
+
+    FROM orders o
+
+    JOIN users u
+      ON u.id = o.user_id
+
+    LEFT JOIN time_slots ts
+      ON ts.id = o.slot_id
+
+    WHERE o.id = $1
+
+    FOR UPDATE OF o
+    `,
+    [orderId]
+  );
+
+  if (orderResult.rows.length === 0) {
+    return {
+      success: false,
+      statusCode: 404,
+      code: "UNKNOWN_ORDER",
+      message: "Unknown order",
+    };
+  }
+
+  const order = orderResult.rows[0];
+
+  if (order.payment_status !== "PAID") {
+    return {
+      success: false,
+      statusCode: 409,
+      code: "UNPAID",
+      message: "Payment Not Completed",
+    };
+  }
+
+  if (order.status === "COMPLETED") {
+    return {
+      success: false,
+      statusCode: 409,
+      code: "ALREADY_PICKED_UP",
+      message: "Order Already Picked Up",
+    };
+  }
+
+  if (order.status !== "PLACED") {
+    return {
+      success: false,
+      statusCode: 409,
+      code: "UNAVAILABLE",
+      message: "Order is not available for pickup",
+    };
+  }
+
+  if (!order.pickup_token || order.pickup_token !== pickupToken) {
+    return {
+      success: false,
+      statusCode: 401,
+      code: "INVALID_QR",
+      message: "Invalid Pickup QR",
+    };
+  }
+
+  const updateResult = await client.query(
+    `
+    UPDATE orders
+    SET
+      status = 'COMPLETED'
+    WHERE id = $1
+    RETURNING
+      id,
+      user_id,
+      slot_id,
+      total_amount,
+      status,
+      payment_status,
+      order_mode,
+      pickup_token,
+      created_at
+    `,
+    [orderId]
+  );
+
+  const completedOrder = updateResult.rows[0];
+
+  const itemsResult = await client.query(
+    `
+    SELECT
+      oi.menu_item_id,
+      mi.name,
+      oi.quantity,
+      oi.price
+    FROM order_items oi
+    JOIN menu_items mi
+      ON mi.id = oi.menu_item_id
+    WHERE oi.order_id = $1
+    ORDER BY mi.name
+    `,
+    [orderId]
+  );
+
+  const io = req.app.get("io");
+
+  if (io) {
+    io.emit("order_completed", completedOrder);
+  }
+
+  return {
+    success: true,
+    order: {
+      ...completedOrder,
+      student_name: order.student_name,
+      student_email: order.student_email,
+      slot_time: order.slot_time,
+      slot_date: order.slot_date,
+      start_time: order.start_time,
+      end_time: order.end_time,
+      items: itemsResult.rows,
+    },
+  };
+}
+
 /* =====================================================
    GET TODAY'S PAID ORDERS
 
@@ -90,10 +238,20 @@ router.get(
           o.payment_status = 'PAID'
 
           AND (
-            o.order_mode = 'live'
+            (
+              o.order_mode = 'live'
+              AND o.slot_id IS NULL
+              AND (
+                o.created_at AT TIME ZONE 'Asia/Kolkata'
+              )::date = (
+                CURRENT_TIMESTAMP
+                AT TIME ZONE 'Asia/Kolkata'
+              )::date
+            )
 
             OR (
-              ts.slot_date = (
+              o.order_mode = 'preorder'
+              AND ts.slot_date = (
                 CURRENT_TIMESTAMP
                 AT TIME ZONE 'Asia/Kolkata'
               )::date
@@ -161,9 +319,11 @@ router.get(
   async (req, res) => {
     try {
       const userId =
-        Number(req.params.userId);
+        parsePositiveInteger(
+          req.params.userId
+        );
 
-      if (!Number.isInteger(userId)) {
+      if (userId === null) {
         return res.status(400).json({
           message:
             "Invalid user ID",
@@ -305,9 +465,11 @@ router.get(
   async (req, res) => {
     try {
       const orderId =
-        Number(req.params.id);
+        parsePositiveInteger(
+          req.params.id
+        );
 
-      if (!Number.isInteger(orderId)) {
+      if (orderId === null) {
         return res.status(400).json({
           message:
             "Invalid order ID",
@@ -464,7 +626,9 @@ router.post(
 
     try {
       const orderId =
-        Number(req.params.id);
+        parsePositiveInteger(
+          req.params.id
+        );
 
       const pickupToken =
         String(
@@ -477,9 +641,7 @@ router.post(
          VALIDATE ORDER ID
       --------------------------------------------- */
 
-      if (
-        !Number.isInteger(orderId)
-      ) {
+      if (orderId === null) {
         return res.status(400).json({
           message:
             "Invalid order ID",
@@ -506,174 +668,28 @@ router.post(
          slot_id = NULL.
       --------------------------------------------- */
 
-      const orderResult =
-        await client.query(
-          `
-          SELECT
-            o.*,
+      const outcome = await finalizePickup({
+        client,
+        req,
+        orderId,
+        pickupToken,
+      });
 
-            u.name AS student_name,
-            u.email AS student_email,
+      if (!outcome.success) {
+        await client.query("ROLLBACK");
 
-            ts.slot_time,
-            ts.slot_date,
-            ts.start_time,
-            ts.end_time
-
-          FROM orders o
-
-          JOIN users u
-            ON u.id = o.user_id
-
-          LEFT JOIN time_slots ts
-            ON ts.id = o.slot_id
-
-          WHERE o.id = $1
-
-          FOR UPDATE OF o
-          `,
-          [orderId]
-        );
-
-      if (
-        orderResult.rows.length === 0
-      ) {
-        await client.query(
-          "ROLLBACK"
-        );
-
-        return res.status(404).json({
-          message:
-            "Order not found",
+        return res.status(outcome.statusCode).json({
+          code: outcome.code,
+          message: outcome.message,
         });
       }
 
-      const order =
-        orderResult.rows[0];
-
-      /* ---------------------------------------------
-         PAYMENT CHECK
-      --------------------------------------------- */
-
-      if (
-        order.payment_status !==
-        "PAID"
-      ) {
-        await client.query(
-          "ROLLBACK"
-        );
-
-        return res.status(409).json({
-          message:
-            "Order payment is not completed",
-        });
-      }
-
-      /* ---------------------------------------------
-         STATUS CHECK
-      --------------------------------------------- */
-
-      if (
-        order.status ===
-        "COMPLETED"
-      ) {
-        await client.query(
-          "ROLLBACK"
-        );
-
-        return res.status(409).json({
-          message:
-            "This order has already been picked up",
-        });
-      }
-
-      if (
-        order.status !==
-        "PLACED"
-      ) {
-        await client.query(
-          "ROLLBACK"
-        );
-
-        return res.status(409).json({
-          message:
-            "Order is not available for pickup",
-        });
-      }
-
-      /* ---------------------------------------------
-         TOKEN CHECK
-      --------------------------------------------- */
-
-      if (
-        !order.pickup_token ||
-        order.pickup_token !==
-          pickupToken
-      ) {
-        await client.query(
-          "ROLLBACK"
-        );
-
-        return res.status(401).json({
-          message:
-            "Invalid pickup token",
-        });
-      }
-
-      /* ---------------------------------------------
-         MARK COMPLETED
-      --------------------------------------------- */
-
-      const updateResult =
-        await client.query(
-          `
-          UPDATE orders
-          SET
-            status = 'COMPLETED'
-          WHERE id = $1
-          RETURNING
-            id,
-            user_id,
-            slot_id,
-            total_amount,
-            status,
-            payment_status,
-            order_mode,
-            pickup_token,
-            created_at
-          `,
-          [orderId]
-        );
-
-      const completedOrder =
-        updateResult.rows[0];
-
-      await client.query(
-        "COMMIT"
-      );
-
-      /* ---------------------------------------------
-         REAL-TIME EVENT
-      --------------------------------------------- */
-
-      const io =
-        req.app.get("io");
-
-      if (io) {
-        io.emit(
-          "order_completed",
-          completedOrder
-        );
-      }
+      await client.query("COMMIT");
 
       res.json({
         success: true,
-
-        message:
-          "Pickup verified successfully",
-
-        order:
-          completedOrder,
+        message: "Pickup verified successfully",
+        order: outcome.order,
       });
 
     } catch (error) {
@@ -696,6 +712,179 @@ router.post(
 
     } finally {
       client.release();
+    }
+  }
+);
+
+router.post(
+  "/pickup-token",
+  authRoutes.verifyToken,
+  authRoutes.adminOnly,
+  async (req, res) => {
+    const pickupToken = String(req.body?.pickup_token || "")
+      .trim()
+      .toUpperCase();
+
+    if (!/^[A-Z0-9]{6}$/.test(pickupToken)) {
+      return res.status(400).json({
+        code: "INVALID_TOKEN",
+        message: "Enter a valid 6-character pickup token.",
+      });
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const orderResult = await client.query(
+        `
+        SELECT id
+        FROM orders
+        WHERE pickup_token = $1
+        LIMIT 2
+        `,
+        [pickupToken]
+      );
+
+      if (orderResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          code: "INVALID_TOKEN",
+          message: "No order was found for that pickup token.",
+        });
+      }
+
+      if (orderResult.rows.length > 1) {
+        await client.query("ROLLBACK");
+        console.error("Pickup token matched multiple orders.");
+        return res.status(409).json({
+          code: "AMBIGUOUS_TOKEN",
+          message: "This pickup token is not unique. Verify the order using its QR.",
+        });
+      }
+
+      const outcome = await finalizePickup({
+        client,
+        req,
+        orderId: orderResult.rows[0].id,
+        pickupToken,
+      });
+
+      if (!outcome.success) {
+        await client.query("ROLLBACK");
+        return res.status(outcome.statusCode).json({
+          code: outcome.code,
+          message: outcome.message,
+        });
+      }
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        message: "Pickup verified successfully",
+        order: outcome.order,
+      });
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Pickup token rollback error:", rollbackError);
+      }
+
+      console.error("Pickup token verification error:", error);
+      return res.status(500).json({
+        message: "Pickup verification failed",
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+router.post(
+  "/scan-qr",
+  authRoutes.verifyToken,
+  authRoutes.adminOnly,
+  async (req, res) => {
+    try {
+      const payload = req.body?.qr ?? req.body;
+      const parsedPayload =
+        typeof payload === "string"
+          ? JSON.parse(payload)
+          : payload;
+
+      if (
+        !parsedPayload ||
+        parsedPayload.type !== "PICT_CANTEEN_PICKUP"
+      ) {
+        return res.status(400).json({
+          code: "INVALID_QR",
+          message: "Invalid Pickup QR",
+        });
+      }
+
+      const orderId = parsePositiveInteger(
+        parsedPayload.order_id
+      );
+      const pickupToken = String(
+        parsedPayload.pickup_token || ""
+      )
+        .trim()
+        .toUpperCase();
+
+      if (orderId === null || !pickupToken) {
+        return res.status(400).json({
+          code: "INVALID_QR",
+          message: "Invalid Pickup QR",
+        });
+      }
+
+      const client = await pool.connect();
+
+      try {
+        await client.query("BEGIN");
+
+        const outcome = await finalizePickup({
+          client,
+          req,
+          orderId,
+          pickupToken,
+        });
+
+        if (!outcome.success) {
+          await client.query("ROLLBACK");
+
+          return res.status(outcome.statusCode).json({
+            code: outcome.code,
+            message: outcome.message,
+          });
+        }
+
+        await client.query("COMMIT");
+
+        return res.json({
+          success: true,
+          message: "Pickup verified successfully",
+          order: outcome.order,
+        });
+      } catch (error) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {}
+
+        throw error;
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      console.error("QR pickup scan error:", error);
+
+      return res.status(400).json({
+        code: "INVALID_QR",
+        message: "Invalid Pickup QR",
+      });
     }
   }
 );

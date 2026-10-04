@@ -10,6 +10,14 @@ const razorpay = require("../utils/razorpay");
    HELPERS
 ===================================================== */
 
+function parsePositiveInteger(value) {
+  const parsedValue = Number(value);
+
+  return Number.isInteger(parsedValue) && parsedValue > 0
+    ? parsedValue
+    : null;
+}
+
 function generatePickupToken() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -78,9 +86,12 @@ router.post("/create-order", async (req, res) => {
        VALIDATION
     ------------------------------------------------ */
 
-    if (!user_id) {
+    const parsedUserId =
+      parsePositiveInteger(user_id);
+
+    if (parsedUserId === null) {
       return res.status(400).json({
-        message: "User ID is required",
+        message: "Valid user ID is required",
       });
     }
 
@@ -111,9 +122,10 @@ router.post("/create-order", async (req, res) => {
         });
       }
 
-      finalSlotId = Number(slot_id);
+      finalSlotId =
+        parsePositiveInteger(slot_id);
 
-      if (!Number.isInteger(finalSlotId)) {
+      if (finalSlotId === null) {
         return res.status(400).json({
           message: "Invalid pickup slot",
         });
@@ -139,7 +151,7 @@ router.post("/create-order", async (req, res) => {
       FROM users
       WHERE id = $1
       `,
-      [user_id]
+      [parsedUserId]
     );
 
     if (userResult.rows.length === 0) {
@@ -402,7 +414,7 @@ router.post("/create-order", async (req, res) => {
           order_mode
         `,
         [
-          user_id,
+          parsedUserId,
           finalSlotId,
           serverTotal,
           expiresAt,
@@ -458,7 +470,7 @@ router.post("/create-order", async (req, res) => {
             String(order.id),
 
           user_id:
-            String(user_id),
+            String(parsedUserId),
 
           slot_id:
             finalSlotId
@@ -598,8 +610,11 @@ router.post("/verify", async (req, res) => {
        VALIDATION
     ------------------------------------------------ */
 
+    const parsedOrderId =
+      parsePositiveInteger(order_id);
+
     if (
-      !order_id ||
+      parsedOrderId === null ||
       !razorpay_order_id ||
       !razorpay_payment_id ||
       !razorpay_signature
@@ -655,7 +670,7 @@ router.post("/verify", async (req, res) => {
         WHERE id = $1
         FOR UPDATE
         `,
-        [order_id]
+        [parsedOrderId]
       );
 
     if (orderResult.rows.length === 0) {
@@ -894,7 +909,7 @@ router.post("/verify", async (req, res) => {
 
       /* Book exactly one slot for this order */
 
-      await client.query(
+      const slotBookResult = await client.query(
         `
         UPDATE time_slots
         SET
@@ -906,9 +921,19 @@ router.post("/verify", async (req, res) => {
               ELSE available
             END
         WHERE id = $1
+          AND booked < capacity
+        RETURNING id
         `,
         [order.slot_id]
       );
+
+      if (slotBookResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          message: "Pickup slot became full",
+        });
+      }
     } else {
       /* LIVE ORDER */
 
@@ -992,7 +1017,7 @@ router.post("/verify", async (req, res) => {
     for (const item of
       orderItemsResult.rows) {
 
-      await client.query(
+      const stockUpdate = await client.query(
         `
         UPDATE menu_items
         SET
@@ -1004,12 +1029,23 @@ router.post("/verify", async (req, res) => {
               ELSE available
             END
         WHERE id = $2
+          AND stock >= $1
+        RETURNING id, stock
         `,
         [
           item.quantity,
           item.menu_item_id,
         ]
       );
+
+      if (stockUpdate.rows.length === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          message:
+            `${item.name} does not have enough stock`,
+        });
+      }
     }
 
     /* -----------------------------------------------
