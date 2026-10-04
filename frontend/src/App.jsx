@@ -87,6 +87,9 @@ function App() {
   const [currentOrder, setCurrentOrder] =
     useState(null);
 
+  const [studentOrders, setStudentOrders] =
+    useState([]);
+
   const [paymentLoading, setPaymentLoading] =
     useState(false);
 
@@ -817,20 +820,7 @@ function App() {
           slot.start_time
         );
 
-      const slotEnd =
-        timeToMinutes(
-          slot.end_time
-        );
-
-      if (orderMode === "live") {
-        return (
-          slotEnd > currentMinutes
-        );
-      }
-
-      return (
-        slotStart > currentMinutes
-      );
+      return slotStart > currentMinutes;
     });
 
   // =========================================================
@@ -951,7 +941,9 @@ function App() {
           user_id: user.id,
 
           slot_id:
-            Number(selectedSlot),
+            orderMode === "preorder"
+              ? Number(selectedSlot)
+              : null,
 
           order_mode: orderMode,
 
@@ -1032,9 +1024,12 @@ function App() {
       return;
     }
 
-    if (!selectedSlot) {
+    if (
+      orderMode === "preorder" &&
+      !selectedSlot
+    ) {
       alert(
-        "Please select a pickup slot."
+        "Please select a pickup slot for preorder."
       );
       return;
     }
@@ -1121,15 +1116,18 @@ function App() {
               user_id: user.id,
 
               slot_id:
-                Number(selectedSlot),
+                verifiedOrder.slot_id ?? null,
 
-              total_amount: total,
+              total_amount:
+                verifiedOrder.total_amount ??
+                total,
 
               status: "PLACED",
 
               payment_status: "PAID",
 
               order_mode:
+                verifiedOrder.order_mode ??
                 orderMode,
 
               pickup_token:
@@ -1141,6 +1139,13 @@ function App() {
 
             setCurrentOrder(
               successfulOrder
+            );
+
+            setStudentOrders(
+              (previous) => [
+                successfulOrder,
+                ...previous,
+              ]
             );
 
             setOrderPlaced(true);
@@ -1286,12 +1291,17 @@ function App() {
             : response.data?.orders ||
               [];
 
+        setStudentOrders(orders);
+
         if (orders.length > 0) {
           setCurrentOrder(
             orders[0]
           );
 
           setOrderPlaced(true);
+        } else {
+          setCurrentOrder(null);
+          setOrderPlaced(false);
         }
       } catch (error) {
         console.error(
@@ -2216,9 +2226,10 @@ function App() {
 
               </div>
 
-              <div className="slot-section">
+              {orderMode === "preorder" && (
+                <div className="slot-section">
 
-                <h3>
+                  <h3>
                   Today's Pickup Slot
                 </h3>
 
@@ -2286,7 +2297,8 @@ function App() {
 
                 )}
 
-              </div>
+                </div>
+              )}
 
               <div className="checkout-summary">
 
@@ -2328,8 +2340,11 @@ function App() {
                 onClick={placeOrder}
                 disabled={
                   paymentLoading ||
-                  !selectedSlot ||
-                  cart.length === 0
+                  cart.length === 0 ||
+                  (
+                    orderMode === "preorder" &&
+                    !selectedSlot
+                  )
                 }
               >
                 {paymentLoading
@@ -2358,45 +2373,26 @@ function App() {
   // =========================================================
 
   const OrdersPage = () => {
-    const order = currentOrder;
 
-    const status =
-      order?.status || "PLACED";
+    const orders =
+      studentOrders.length > 0
+        ? studentOrders
+        : currentOrder
+        ? [currentOrder]
+        : [];
 
-    const getSlotText = () => {
-      if (!order?.slot_id) {
-        return "Today's pickup slot";
-      }
-
-      const slot = slots.find(
-        (item) =>
-          Number(item.id) ===
-          Number(order.slot_id)
-      );
-
-      return (
-        slot?.slot_time ||
-        "Today's pickup slot"
-      );
-    };
-
-    if (!orderPlaced && !order) {
+    if (orders.length === 0) {
       return (
         <main className="page-container">
 
           <div className="page-header">
-
             <div>
-              <h1>
-                Your Orders
-              </h1>
+              <h1>Your Orders</h1>
 
               <p>
-                Track your canteen
-                orders.
+                Today's canteen orders.
               </p>
             </div>
-
           </div>
 
           <div className="empty-state">
@@ -2429,6 +2425,30 @@ function App() {
       );
     }
 
+    const getSlotText = (order) => {
+
+      if (!order?.slot_id) {
+        return "Live Order";
+      }
+
+      const slot =
+        slots.find(
+          (item) =>
+            Number(item.id) ===
+            Number(order.slot_id)
+        );
+
+      return (
+        slot?.slot_time ||
+        (
+          order.start_time &&
+          order.end_time
+            ? `${order.start_time} - ${order.end_time}`
+            : "Today's pickup slot"
+        )
+      );
+    };
+
     return (
       <main className="page-container">
 
@@ -2436,164 +2456,275 @@ function App() {
 
           <div>
             <h1>
-              Your Order
+              Today's Orders
             </h1>
 
             <p>
-              Order #{order?.id}
+              {orders.length} order
+              {orders.length !== 1
+                ? "s"
+                : ""}{" "}
+              placed today.
             </p>
           </div>
 
         </div>
 
-        <div className="order-tracking-card">
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "24px",
+          }}
+        >
 
-          <div
-            className={`order-status ${
-              status === "COMPLETED"
-                ? "completed"
-                : "placed"
-            }`}
-          >
+          {orders.map((order) => {
 
-            <div className="status-icon">
+            const status =
+              order?.status ||
+              "PLACED";
 
-              {status ===
-              "COMPLETED" ? (
-                <CheckCircle2
-                  size={27}
-                />
-              ) : (
-                <Clock size={27} />
-              )}
+            return (
+              <div
+                className="order-tracking-card"
+                key={order.id}
+              >
 
-            </div>
+                <div
+                  className={`order-status ${
+                    status === "COMPLETED"
+                      ? "completed"
+                      : "placed"
+                  }`}
+                >
 
-            <div className="order-main-status">
+                  <div className="status-icon">
 
-              <h2>
-                {status ===
-                "COMPLETED"
-                  ? "Order Completed"
-                  : "Order Placed"}
-              </h2>
+                    {status ===
+                    "COMPLETED" ? (
+                      <CheckCircle2
+                        size={27}
+                      />
+                    ) : (
+                      <Clock
+                        size={27}
+                      />
+                    )}
 
-              <p>
-                {status ===
-                "COMPLETED"
-                  ? "Your food has been collected successfully."
-                  : "Your payment is confirmed. Please collect your food at the selected pickup slot."}
-              </p>
+                  </div>
 
-            </div>
+                  <div className="order-main-status">
 
-          </div>
+                    <h2>
+                      {status ===
+                      "COMPLETED"
+                        ? "Order Completed"
+                        : "Order Placed"}
+                    </h2>
 
-          <div className="order-details-grid">
+                    <p>
+                      {status ===
+                      "COMPLETED"
+                        ? "Your food has been collected successfully."
+                        : "Your payment is confirmed. Please collect your food."}
+                    </p>
 
-            <div className="order-detail-box">
-              <span>
-                Order ID
-              </span>
+                  </div>
 
-              <strong>
-                #{order?.id}
-              </strong>
-            </div>
+                </div>
 
-            <div className="order-detail-box">
-              <span>
-                Pickup Slot
-              </span>
+                <div className="order-details-grid">
 
-              <strong>
-                {getSlotText()}
-              </strong>
-            </div>
+                  <div className="order-detail-box">
+                    <span>
+                      Order ID
+                    </span>
 
-            <div className="order-detail-box">
-              <span>
-                Order Type
-              </span>
+                    <strong>
+                      #{order.id}
+                    </strong>
+                  </div>
 
-              <strong>
-                {getOrderModeLabel(
-                  order?.order_mode
-                )}
-              </strong>
-            </div>
+                  <div className="order-detail-box">
+                    <span>
+                      Order Type
+                    </span>
 
-            <div className="order-detail-box">
-              <span>
-                Payment
-              </span>
+                    <strong>
+                      {getOrderModeLabel(
+                        order.order_mode
+                      )}
+                    </strong>
+                  </div>
 
-              <strong>
-                {order?.payment_status ||
-                  "PAID"}
-              </strong>
-            </div>
+                  <div className="order-detail-box">
+                    <span>
+                      Pickup
+                    </span>
 
-            <div className="order-detail-box">
-              <span>
-                Total
-              </span>
+                    <strong>
+                      {getSlotText(order)}
+                    </strong>
+                  </div>
 
-              <strong>
-                ₹
-                {Number(
-                  order?.total_amount || 0
-                ).toFixed(2)}
-              </strong>
-            </div>
+                  <div className="order-detail-box">
+                    <span>
+                      Payment
+                    </span>
 
-          </div>
+                    <strong>
+                      {order.payment_status}
+                    </strong>
+                  </div>
 
-          {status !== "COMPLETED" &&
-            order?.pickup_token && (
+                  <div className="order-detail-box">
+                    <span>
+                      Total
+                    </span>
 
-              <div className="pickup-token-card">
+                    <strong>
+                      ₹
+                      {Number(
+                        order.total_amount ||
+                          0
+                      ).toFixed(2)}
+                    </strong>
+                  </div>
 
-                <span>
-                  Pickup QR
-                </span>
+                </div>
 
                 <div
                   style={{
-                    display: "flex",
-                    justifyContent: "center",
-                    margin: "18px 0",
+                    marginTop: "20px",
                   }}
                 >
-                  <QRCodeSVG
-                    value={JSON.stringify({
-                      type: "PICT_CANTEEN_PICKUP",
-                      order_id: Number(order.id),
-                      pickup_token: order.pickup_token,
-                    })}
-                    size={220}
-                    level="H"
-                  />
+
+                  <h3>
+                    Ordered Items
+                  </h3>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "8px",
+                      marginTop: "10px",
+                    }}
+                  >
+
+                    {(order.items || []).map(
+                      (item, index) => (
+
+                        <div
+                          key={
+                            item.menu_item_id ||
+                            index
+                          }
+                          style={{
+                            display: "flex",
+                            justifyContent:
+                              "space-between",
+                            padding:
+                              "10px 12px",
+                            borderRadius:
+                              "8px",
+                            background:
+                              "#f8fafc",
+                          }}
+                        >
+
+                          <span>
+                            {item.name}
+                          </span>
+
+                          <strong>
+                            ×{" "}
+                            {item.quantity}
+                          </strong>
+
+                        </div>
+
+                      )
+                    )}
+
+                  </div>
+
                 </div>
 
-                <strong>
-                  Order #{order.id}
-                </strong>
+                {status !==
+                  "COMPLETED" &&
+                  order.pickup_token && (
 
-                <p>
-                  Show this QR code at the canteen counter to collect your order.
-                </p>
+                    <div
+                      className="pickup-token-card"
+                      style={{
+                        marginTop:
+                          "20px",
+                      }}
+                    >
+
+                      <span>
+                        Pickup QR
+                      </span>
+
+                      <div
+                        style={{
+                          display:
+                            "flex",
+                          justifyContent:
+                            "center",
+                          margin:
+                            "18px 0",
+                        }}
+                      >
+
+                        <QRCodeSVG
+                          value={JSON.stringify(
+                            {
+                              type:
+                                "PICT_CANTEEN_PICKUP",
+
+                              order_id:
+                                Number(
+                                  order.id
+                                ),
+
+                              pickup_token:
+                                order.pickup_token,
+                            }
+                          )}
+                          size={220}
+                          level="H"
+                        />
+
+                      </div>
+
+                      <strong>
+                        Order #{order.id}
+                      </strong>
+
+                      <p>
+                        Show this QR code
+                        at the canteen
+                        counter to collect
+                        your order.
+                      </p>
+
+                    </div>
+
+                  )}
 
               </div>
-
-            )}
+            );
+          })}
 
         </div>
 
       </main>
     );
   };
-    // =========================================================
+
+  // =========================================================
   // ADMIN DASHBOARD
   // =========================================================
 

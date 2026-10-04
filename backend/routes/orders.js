@@ -5,7 +5,6 @@ const router = express.Router();
 const pool = require("../db");
 const authRoutes = require("./auth");
 
-
 /* =====================================================
    GET TODAY'S PAID ORDERS
 
@@ -13,10 +12,12 @@ const authRoutes = require("./auth");
 
    ADMIN ONLY
 
-   Used by:
-   - Admin preparation queue
+   Includes:
+   - Live Orders
+   - Preorders
+   - Today's orders only
 
-   Orders are sorted by pickup slot time.
+   Live Orders have no slot.
 ===================================================== */
 
 router.get(
@@ -76,7 +77,7 @@ router.get(
         JOIN users u
           ON u.id = o.user_id
 
-        JOIN time_slots ts
+        LEFT JOIN time_slots ts
           ON ts.id = o.slot_id
 
         LEFT JOIN order_items oi
@@ -88,10 +89,16 @@ router.get(
         WHERE
           o.payment_status = 'PAID'
 
-          AND ts.slot_date = (
-            CURRENT_TIMESTAMP
-            AT TIME ZONE 'Asia/Kolkata'
-          )::date
+          AND (
+            o.order_mode = 'live'
+
+            OR (
+              ts.slot_date = (
+                CURRENT_TIMESTAMP
+                AT TIME ZONE 'Asia/Kolkata'
+              )::date
+            )
+          )
 
         GROUP BY
           o.id,
@@ -105,12 +112,18 @@ router.get(
           ts.booked
 
         ORDER BY
-          ts.start_time ASC,
+          CASE
+            WHEN o.order_mode = 'live'
+            THEN 0
+            ELSE 1
+          END,
+
+          ts.start_time ASC NULLS LAST,
+
           o.id ASC
       `);
 
       res.json(result.rows);
-
     } catch (error) {
       console.error(
         "Get orders error:",
@@ -118,7 +131,156 @@ router.get(
       );
 
       res.status(500).json({
-        message: "Failed to fetch orders",
+        message:
+          "Failed to fetch orders",
+      });
+    }
+  }
+);
+
+
+/* =====================================================
+   GET ALL ORDERS FOR A STUDENT - TODAY ONLY
+
+   GET /api/orders/user/:userId
+
+   Student:
+   - Own orders only
+
+   Admin:
+   - Can access any student's orders
+
+   IMPORTANT:
+   Returns ALL paid orders made by the user today.
+   Not just the latest order.
+===================================================== */
+
+router.get(
+  "/user/:userId",
+  authRoutes.verifyToken,
+  async (req, res) => {
+    try {
+      const userId =
+        Number(req.params.userId);
+
+      if (!Number.isInteger(userId)) {
+        return res.status(400).json({
+          message:
+            "Invalid user ID",
+        });
+      }
+
+      /* ---------------------------------------------
+         STUDENT OWNERSHIP CHECK
+      --------------------------------------------- */
+
+      if (
+        req.user.role !== "admin" &&
+        Number(req.user.id) !== userId
+      ) {
+        return res.status(403).json({
+          message:
+            "You can only access your own orders",
+        });
+      }
+
+      /* ---------------------------------------------
+         TODAY'S PAID ORDERS
+      --------------------------------------------- */
+
+      const result =
+        await pool.query(
+          `
+          SELECT
+
+            o.id,
+            o.user_id,
+            o.slot_id,
+            o.total_amount,
+            o.status,
+            o.payment_status,
+            o.order_mode,
+            o.pickup_token,
+            o.token_generated_at,
+            o.created_at,
+
+            ts.slot_time,
+            ts.slot_date,
+            ts.start_time,
+            ts.end_time,
+
+            COALESCE(
+              json_agg(
+                json_build_object(
+                  'menu_item_id',
+                  oi.menu_item_id,
+
+                  'name',
+                  mi.name,
+
+                  'quantity',
+                  oi.quantity,
+
+                  'price',
+                  oi.price
+                )
+                ORDER BY mi.name
+              )
+              FILTER (
+                WHERE oi.id IS NOT NULL
+              ),
+              '[]'
+            ) AS items
+
+          FROM orders o
+
+          LEFT JOIN time_slots ts
+            ON ts.id = o.slot_id
+
+          LEFT JOIN order_items oi
+            ON oi.order_id = o.id
+
+          LEFT JOIN menu_items mi
+            ON mi.id = oi.menu_item_id
+
+          WHERE
+            o.user_id = $1
+
+            AND o.payment_status = 'PAID'
+
+            AND (
+              (
+                o.created_at AT TIME ZONE 'Asia/Kolkata'
+              )::date = (
+                CURRENT_TIMESTAMP
+                AT TIME ZONE 'Asia/Kolkata'
+              )::date
+            )
+
+          GROUP BY
+            o.id,
+            ts.slot_time,
+            ts.slot_date,
+            ts.start_time,
+            ts.end_time
+
+          ORDER BY
+            o.created_at DESC
+          `,
+          [userId]
+        );
+
+      res.json(result.rows);
+
+    } catch (error) {
+      console.error(
+        "Get student orders error:",
+        error
+      );
+
+      res.status(500).json({
+        message:
+          "Failed to fetch student orders",
       });
     }
   }
@@ -130,11 +292,11 @@ router.get(
 
    GET /api/orders/:id
 
-   ADMIN:
-   - Can access any order
+   Admin:
+   - Any order
 
-   STUDENT:
-   - Can access only their own order
+   Student:
+   - Own order only
 ===================================================== */
 
 router.get(
@@ -147,90 +309,95 @@ router.get(
 
       if (!Number.isInteger(orderId)) {
         return res.status(400).json({
-          message: "Invalid order ID",
+          message:
+            "Invalid order ID",
         });
       }
 
-      const result = await pool.query(
-        `
-        SELECT
-          o.id,
-          o.user_id,
-          o.slot_id,
-          o.total_amount,
-          o.status,
-          o.payment_status,
-          o.order_mode,
-          o.pickup_token,
-          o.token_generated_at,
-          o.created_at,
+      const result =
+        await pool.query(
+          `
+          SELECT
 
-          u.name AS student_name,
-          u.email AS student_email,
+            o.id,
+            o.user_id,
+            o.slot_id,
+            o.total_amount,
+            o.status,
+            o.payment_status,
+            o.order_mode,
+            o.pickup_token,
+            o.token_generated_at,
+            o.created_at,
 
-          ts.slot_time,
-          ts.slot_date,
-          ts.start_time,
-          ts.end_time,
+            u.name AS student_name,
+            u.email AS student_email,
 
-          COALESCE(
-            json_agg(
-              json_build_object(
-                'menu_item_id',
-                oi.menu_item_id,
+            ts.slot_time,
+            ts.slot_date,
+            ts.start_time,
+            ts.end_time,
 
-                'name',
-                mi.name,
+            COALESCE(
+              json_agg(
+                json_build_object(
+                  'menu_item_id',
+                  oi.menu_item_id,
 
-                'quantity',
-                oi.quantity,
+                  'name',
+                  mi.name,
 
-                'price',
-                oi.price
+                  'quantity',
+                  oi.quantity,
+
+                  'price',
+                  oi.price
+                )
+                ORDER BY mi.name
               )
-              ORDER BY mi.name
-            )
-            FILTER (
-              WHERE oi.id IS NOT NULL
-            ),
-            '[]'
-          ) AS items
+              FILTER (
+                WHERE oi.id IS NOT NULL
+              ),
+              '[]'
+            ) AS items
 
-        FROM orders o
+          FROM orders o
 
-        JOIN users u
-          ON u.id = o.user_id
+          JOIN users u
+            ON u.id = o.user_id
 
-        JOIN time_slots ts
-          ON ts.id = o.slot_id
+          LEFT JOIN time_slots ts
+            ON ts.id = o.slot_id
 
-        LEFT JOIN order_items oi
-          ON oi.order_id = o.id
+          LEFT JOIN order_items oi
+            ON oi.order_id = o.id
 
-        LEFT JOIN menu_items mi
-          ON mi.id = oi.menu_item_id
+          LEFT JOIN menu_items mi
+            ON mi.id = oi.menu_item_id
 
-        WHERE o.id = $1
+          WHERE o.id = $1
 
-        GROUP BY
-          o.id,
-          u.name,
-          u.email,
-          ts.slot_time,
-          ts.slot_date,
-          ts.start_time,
-          ts.end_time
-        `,
-        [orderId]
-      );
+          GROUP BY
+            o.id,
+            u.name,
+            u.email,
+            ts.slot_time,
+            ts.slot_date,
+            ts.start_time,
+            ts.end_time
+          `,
+          [orderId]
+        );
 
       if (result.rows.length === 0) {
         return res.status(404).json({
-          message: "Order not found",
+          message:
+            "Order not found",
         });
       }
 
-      const order = result.rows[0];
+      const order =
+        result.rows[0];
 
       /* ---------------------------------------------
          STUDENT CAN ONLY ACCESS OWN ORDER
@@ -238,7 +405,8 @@ router.get(
 
       if (
         req.user.role !== "admin" &&
-        req.user.id !== order.user_id
+        Number(req.user.id) !==
+          Number(order.user_id)
       ) {
         return res.status(403).json({
           message:
@@ -264,157 +432,25 @@ router.get(
 
 
 /* =====================================================
-   GET ORDERS FOR A STUDENT
-
-   GET /api/orders/user/:userId
-
-   STUDENT:
-   - Own orders only
-
-   ADMIN:
-   - Can access any student's orders
-
-   Only paid orders are returned.
-   Sorted by newest first.
-===================================================== */
-
-router.get(
-  "/user/:userId",
-  authRoutes.verifyToken,
-  async (req, res) => {
-    try {
-      const userId =
-        Number(req.params.userId);
-
-      if (!Number.isInteger(userId)) {
-        return res.status(400).json({
-          message: "Invalid user ID",
-        });
-      }
-
-      /* ---------------------------------------------
-         STUDENT OWNERSHIP CHECK
-      --------------------------------------------- */
-
-      if (
-        req.user.role !== "admin" &&
-        req.user.id !== userId
-      ) {
-        return res.status(403).json({
-          message:
-            "You can only access your own orders",
-        });
-      }
-
-      const result = await pool.query(
-        `
-        SELECT
-          o.id,
-          o.user_id,
-          o.slot_id,
-          o.total_amount,
-          o.status,
-          o.payment_status,
-          o.order_mode,
-          o.pickup_token,
-          o.token_generated_at,
-          o.created_at,
-
-          ts.slot_time,
-          ts.slot_date,
-          ts.start_time,
-          ts.end_time,
-
-          COALESCE(
-            json_agg(
-              json_build_object(
-                'menu_item_id',
-                oi.menu_item_id,
-
-                'name',
-                mi.name,
-
-                'quantity',
-                oi.quantity,
-
-                'price',
-                oi.price
-              )
-              ORDER BY mi.name
-            )
-            FILTER (
-              WHERE oi.id IS NOT NULL
-            ),
-            '[]'
-          ) AS items
-
-        FROM orders o
-
-        JOIN time_slots ts
-          ON ts.id = o.slot_id
-
-        LEFT JOIN order_items oi
-          ON oi.order_id = o.id
-
-        LEFT JOIN menu_items mi
-          ON mi.id = oi.menu_item_id
-
-        WHERE
-          o.user_id = $1
-
-          AND o.payment_status = 'PAID'
-
-        GROUP BY
-          o.id,
-          ts.slot_time,
-          ts.slot_date,
-          ts.start_time,
-          ts.end_time
-
-        ORDER BY
-          o.created_at DESC
-        `,
-        [userId]
-      );
-
-      res.json(result.rows);
-
-    } catch (error) {
-      console.error(
-        "Get student orders error:",
-        error
-      );
-
-      res.status(500).json({
-        message:
-          "Failed to fetch student orders",
-      });
-    }
-  }
-);
-
-
-/* =====================================================
    VERIFY PICKUP TOKEN
 
    POST /api/orders/:id/pickup
 
    ADMIN ONLY
 
-   Request:
-   {
-     "pickup_token": "ABC123"
-   }
+   Works for BOTH:
+   - Live Order
+   - Preorder
 
    Flow:
 
    Student arrives
-          ↓
-   Admin enters/scans token
-          ↓
+        ↓
+   Admin scans QR / enters token
+        ↓
    Backend verifies
-          ↓
-   Order becomes COMPLETED
+        ↓
+   COMPLETED
 ===================================================== */
 
 router.post(
@@ -445,7 +481,8 @@ router.post(
         !Number.isInteger(orderId)
       ) {
         return res.status(400).json({
-          message: "Invalid order ID",
+          message:
+            "Invalid order ID",
         });
       }
 
@@ -464,6 +501,9 @@ router.post(
 
       /* ---------------------------------------------
          LOCK ORDER
+
+         LEFT JOIN because Live Order has
+         slot_id = NULL.
       --------------------------------------------- */
 
       const orderResult =
@@ -485,7 +525,7 @@ router.post(
           JOIN users u
             ON u.id = o.user_id
 
-          JOIN time_slots ts
+          LEFT JOIN time_slots ts
             ON ts.id = o.slot_id
 
           WHERE o.id = $1
@@ -548,7 +588,8 @@ router.post(
       }
 
       if (
-        order.status !== "PLACED"
+        order.status !==
+        "PLACED"
       ) {
         await client.query(
           "ROLLBACK"
@@ -587,11 +628,9 @@ router.post(
         await client.query(
           `
           UPDATE orders
-
-          SET status = 'COMPLETED'
-
+          SET
+            status = 'COMPLETED'
           WHERE id = $1
-
           RETURNING
             id,
             user_id,
@@ -599,6 +638,7 @@ router.post(
             total_amount,
             status,
             payment_status,
+            order_mode,
             pickup_token,
             created_at
           `,
@@ -655,9 +695,7 @@ router.post(
       });
 
     } finally {
-
       client.release();
-
     }
   }
 );
