@@ -30,7 +30,7 @@ function Register({ onRegister, onSwitch }) {
       setLoading(true);
 
       const response = await axios.post(
-        "http://localhost:5000/api/auth/register",
+        "https://pict-canteen-backend.onrender.com/api/auth/register",
         {
           name,
           email,

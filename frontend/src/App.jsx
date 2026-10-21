@@ -29,7 +29,7 @@ import Login from "./LoginTemp.jsx";
 import Register from "./RegisterTemp.jsx";
 import "./App.css";
 
-const API_URL = "http://localhost:5000";
+const API_URL = "https://pict-canteen-backend.onrender.com";
 
 function getIstMonthYear() {
   const parts = new Intl.DateTimeFormat("en-GB", {

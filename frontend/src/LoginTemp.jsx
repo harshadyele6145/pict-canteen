@@ -22,7 +22,7 @@ function Login({ onLogin, onSwitch }) {
       setLoading(true);
 
       const response = await axios.post(
-        "http://localhost:5000/api/auth/login",
+        "https://pict-canteen-backend.onrender.com/api/auth/login",
         {
           email,
           password,
